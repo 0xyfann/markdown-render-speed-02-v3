@@ -852,7 +852,7 @@ function lexBlocks(lines, state, topLevel) {
         // The block's last line keeps its newline unless a blank line
         // follows the block (or the source ends without one).
         let text = body.join('\n');
-        const followedByBlank = i < n && isBlankLine(lines[i]);
+        const followedByBlank = i < n && (type >= 6 ? isBlankLine(lines[i]) : lines[i] === '');
         if (!followedByBlank && (i < n || (topLevel && state.endsWithNl))) text += '\n';
         pushBlock({ t: 'html', text });
         continue;
@@ -1193,13 +1193,41 @@ function wrapSiblings(parent, after, container) {
   parent.last = container;
 }
 
-const EMAIL_RE = /^[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+/;
+const EMAIL_RE = /^[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?)+/;
+
+// Follow rule for a matched email: when the next character is - or _ the
+// address may not end there, so drop the last domain label (the result
+// must keep a dot in the domain). A following _ needs no drop when the
+// run of underscores closes an emphasis span opened before the address.
+function finishEmail(text, s, end, delims) {
+  let t = text, e = end;
+  for (;;) {
+    const nx = s[e];
+    if (nx !== '-' && nx !== '_') return t;
+    if (nx === '_') {
+      let runEnd = e;
+      while (s[runEnd] === '_') runEnd++;
+      const after = runEnd < s.length ? s[runEnd] : '';
+      const closesSpan = delims !== null
+        && !/[\p{L}\p{N}]/u.test(after)
+        && delims.some(d => d.ch === '_' && d.canOpen && d.len > 0);
+      if (closesSpan) return t;
+    }
+    const at = t.indexOf('@');
+    const dot = t.lastIndexOf('.');
+    if (dot <= at) return null;
+    const nt = t.slice(0, dot);
+    if (!nt.slice(at + 1).includes('.')) return null;
+    e -= t.length - nt.length;
+    t = nt;
+  }
+}
 const SCHEME_AUTOLINK_RE = /^<([A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\s]*)>/;
 const EMAIL_AUTOLINK_RE = /^<([A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+)>/;
 
 // Try an extended (GFM) autolink at s[i]: http(s)://, ftp://, www., or an
 // email address. Returns { text, href, end } or null.
-function matchExtendedAutolink(s, i, inBrackets) {
+function matchExtendedAutolink(s, i, inBrackets, delims) {
   if (IN_LINK) return null;
   // word boundary: the previous character must not be part of an address
   const prev = i > 0 ? s[i - 1] : '';
@@ -1221,22 +1249,26 @@ function matchExtendedAutolink(s, i, inBrackets) {
   }
   if (head.startsWith('mailto:')) {
     const m = EMAIL_RE.exec(s.slice(i + 7, i + 7 + 320));
-    if (m && emailTailOk(s, i + 7 + m[0].length)) {
-      const text = s.slice(i, i + 7) + m[0];
-      return { text, href: text, end: i + text.length };
+    if (m) {
+      const em = finishEmail(m[0], s, i + 7 + m[0].length, delims);
+      if (em) {
+        const text = s.slice(i, i + 7) + em;
+        return { text, href: text, end: i + text.length };
+      }
     }
     return null;
   }
   if (head.startsWith('xmpp:')) {
     const m = EMAIL_RE.exec(s.slice(i + 5, i + 5 + 320));
     if (m) {
-      let end = i + 5 + m[0].length;
-      if (s[end] === '/') {
-        let j = end + 1;
-        while (j < s.length && !isSpace(s[j]) && s[j] !== '<' && s[j] !== '/') j++;
-        if (j > end + 1) end = j;
-      }
-      if (emailTailOk(s, end)) {
+      const em = finishEmail(m[0], s, i + 5 + m[0].length, delims);
+      if (em) {
+        let end = i + 5 + em.length;
+        if (s[end] === '/') {
+          let j = end + 1;
+          while (j < s.length && !isSpace(s[j]) && s[j] !== '<' && s[j] !== '/') j++;
+          if (j > end + 1) end = j;
+        }
         const text = s.slice(i, end);
         return { text, href: text, end };
       }
@@ -1245,15 +1277,9 @@ function matchExtendedAutolink(s, i, inBrackets) {
   }
   const m = EMAIL_RE.exec(s.slice(i, i + 320));
   if (!m) return null;
-  if (!emailTailOk(s, i + m[0].length)) return null;
-  return { text: m[0], href: 'mailto:' + m[0], end: i + m[0].length };
-}
-
-// An email autolink is invalid when the address continues with - or _
-// (the domain would end with one of them).
-function emailTailOk(s, end) {
-  const c = s[end];
-  return c !== '-' && c !== '_';
+  const em = finishEmail(m[0], s, i + m[0].length, delims);
+  if (!em) return null;
+  return { text: em, href: 'mailto:' + em, end: i + em.length };
 }
 
 // GFM trailing-punctuation rules for extended autolinks.
@@ -1282,7 +1308,9 @@ function trimAutolinkEnd(text, minLen, whole, start) {
 
 function parseInline(text, links) {
   const root = inode('root');
-  const delims = [];   // { node, ch, len, canOpen, canClose }
+  const delims = [];   // { node, ch, len, canOpen, canClose, pos, origLen }
+  const matchedClosers = []; // { ch, pos, end } closer runs that have matched
+  const allRuns = []; // every delimiter entry, for the rule above
   const brackets = []; // { node, image, delimLen, inactive }
   const s = text;
   const n = s.length;
@@ -1311,6 +1339,32 @@ function parseInline(text, links) {
           const sum = o.len + closer.len;
           if (sum % 3 === 0 && !(o.len % 3 === 0 && closer.len % 3 === 0)) continue;
         }
+        // Marked rejects a match whose span contains a mixed-weight
+        // emphasis (em inside strong or strong inside em) that was closed
+        // by a run immediately followed by an alphanumeric, when this
+        // closer also directly follows an alphanumeric — unless the inner
+        // opener is itself intraword, or a delimiter run that never
+        // matched sits between that inner closer and this one.
+        const use = o.len >= 2 && closer.len >= 2 ? 2 : 1;
+        const candWeight = o.origLen >= 2 ? 2 : 1;
+        if (closer.pos > 0 && /[\p{L}\p{N}]/u.test(s[closer.pos - 1])) {
+          let blocked = false;
+          for (const mc of matchedClosers) {
+            if (mc.ch !== closer.ch || mc.pos <= o.pos || mc.pos >= closer.pos) continue;
+            if (mc.use === candWeight) continue; // same weight nests freely
+            if (!(mc.end < s.length && /[\p{L}\p{N}]/u.test(s[mc.end]))) continue;
+            if (mc.openerPos > 0 && /[\p{L}\p{N}]/u.test(s[mc.openerPos - 1])) continue;
+            let cancelled = false;
+            for (const r of allRuns) {
+              if (r.ch === closer.ch && !r.used && r.pos > mc.pos && r.pos < closer.pos) {
+                cancelled = true;
+                break;
+              }
+            }
+            if (!cancelled) { blocked = true; break; }
+          }
+          if (blocked) continue;
+        }
         openerPos = j;
         break;
       }
@@ -1337,6 +1391,9 @@ function parseInline(text, links) {
         opener.node.next = wrap;
         closer.node.prev = wrap;
         if (root.last === closer.node) root.last = closer.node; // unchanged
+        matchedClosers.push({ ch: closer.ch, pos: closer.pos, end: closer.pos + closer.origLen, use, openerPos: opener.pos });
+        opener.used = true;
+        closer.used = true;
         opener.len -= use;
         closer.len -= use;
         opener.node.s = opener.node.s.slice(0, opener.len);
@@ -1632,14 +1689,16 @@ function parseInline(text, links) {
       const node = inode('text', s.slice(i, i + runLen));
       node.delimRun = true;
       addNode(node);
-      delims.push({ node, ch: c, len: runLen, canOpen, canClose });
+      const entry = { node, ch: c, len: runLen, canOpen, canClose, pos: i, origLen: runLen, used: false };
+      delims.push(entry);
+      allRuns.push(entry);
       i += runLen;
       continue;
     }
 
     // extended autolinks at word starts
     if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
-      const auto = matchExtendedAutolink(s, i, brackets.length > 0);
+      const auto = matchExtendedAutolink(s, i, brackets.length > 0, delims);
       if (auto) {
         const link = inode('link');
         link.href = auto.href;
