@@ -1225,6 +1225,52 @@ function finishEmail(text, s, end, delims) {
 const SCHEME_AUTOLINK_RE = /^<([A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\s]*)>/;
 const EMAIL_AUTOLINK_RE = /^<([A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+)>/;
 
+// Validate a link label starting after the bracket at s[i] ('['), using
+// marked's label grammar: balanced nested brackets, backslash escapes,
+// backtick units (`+ ... `+) at the top level, and a trailing run of 2+
+// backticks right before the closing bracket. Returns the index of the
+// closing ']' or -1 when the label is invalid (no link can form).
+function scanLabelEnd(s, i) {
+  const n = s.length;
+  let depth = 0, j = i + 1;
+  while (j < n) {
+    const c = s[j];
+    if (c === '\\') { j += 2; continue; }
+    if (c === '[') { depth++; j++; continue; }
+    if (c === ']') {
+      if (depth === 0) return j;
+      depth--; j++; continue;
+    }
+    if (c === '`' && depth === 0) {
+      let run = 0;
+      while (s[j + run] === '`') run++;
+      // find the closing run of the unit; the search fails at a ] that
+      // would end a link (followed by ( or [) at the unit's own depth
+      let k = j + run, udepth = 0, closed = -1;
+      while (k < n) {
+        const cc = s[k];
+        if (cc === '`') { closed = k; break; }
+        if (cc === '[') udepth++;
+        else if (cc === ']') {
+          if (udepth === 0 && (s[k + 1] === '(' || s[k + 1] === '[')) break;
+          if (udepth > 0) udepth--;
+        }
+        k++;
+      }
+      if (closed === -1) {
+        if (run >= 2 && s[j + run] === ']') return j + run;
+        return -1;
+      }
+      let run2 = 0;
+      while (s[closed + run2] === '`') run2++;
+      j = closed + run2;
+      continue;
+    }
+    j++;
+  }
+  return -1;
+}
+
 // Try an extended (GFM) autolink at s[i]: http(s)://, ftp://, www., or an
 // email address. Returns { text, href, end } or null.
 function matchExtendedAutolink(s, i, inBrackets, delims) {
@@ -1243,6 +1289,7 @@ function matchExtendedAutolink(s, i, inBrackets, delims) {
     while (j < s.length && !isSpace(s[j]) && s[j] !== '<'
         && !(inBrackets && s[j] === ']')) j++;
     let text = s.slice(i, j);
+    text = cutUnmatchedParen(text);
     text = trimAutolinkEnd(text, 0, s, i);
     if (text.length <= prefix.length) return null;
     return { text, href: hrefPrefix + text, end: i + text.length };
@@ -1282,6 +1329,15 @@ function matchExtendedAutolink(s, i, inBrackets, delims) {
   return { text: em, href: 'mailto:' + em, end: i + em.length };
 }
 
+// An autolink may not contain an opening paren that is never closed:
+// the link is cut just before the first ( with no ) after it.
+function cutUnmatchedParen(text) {
+  for (let k = 0; k < text.length; k++) {
+    if (text[k] === '(' && text.indexOf(')', k) === -1) return text.slice(0, k);
+  }
+  return text;
+}
+
 // GFM trailing-punctuation rules for extended autolinks.
 function trimAutolinkEnd(text, minLen, whole, start) {
   let t = text;
@@ -1306,6 +1362,34 @@ function trimAutolinkEnd(text, minLen, whole, start) {
   return t;
 }
 
+// Does this link label poison later emphasis? Scan it the way code
+// spans are scanned (a run matches a later run of exactly the same
+// length); the label poisons when some run finds no match while a
+// further backtick run still follows it in the label.
+function labelPoison(label) {
+  const n = label.length;
+  let i = 0;
+  while (i < n) {
+    const c = label[i];
+    if (c === '\\') { i += 2; continue; }
+    if (c !== '`') { i++; continue; }
+    let len = 0;
+    while (label[i + len] === '`') len++;
+    let j = i + len, found = -1;
+    while (j < n) {
+      if (label[j] === '`') {
+        let l = 0;
+        while (label[j + l] === '`') l++;
+        if (l === len) { found = j; break; }
+        j += l;
+      } else j++;
+    }
+    if (found === -1) return label.indexOf('`', i + len) !== -1;
+    i = found + len;
+  }
+  return false;
+}
+
 function parseInline(text, links) {
   const root = inode('root');
   const delims = [];   // { node, ch, len, canOpen, canClose, pos, origLen }
@@ -1315,6 +1399,12 @@ function parseInline(text, links) {
   const s = text;
   const n = s.length;
   let i = 0;
+  // End positions of inline links/images whose label leaves a backtick
+  // run unmatched in the label's own code-span scan (with a later run
+  // still following it). After such a link, marked rejects every
+  // emphasis match whose closer is followed by a backtick anywhere
+  // later in the same inline source.
+  const poisonEnds = [];
 
   function addText(str) {
     if (!str) return;
@@ -1331,6 +1421,14 @@ function parseInline(text, links) {
     }
     while (closerPos !== -1) {
       const closer = delims[closerPos];
+      if (poisonEnds.some(e => e <= closer.pos) && s.indexOf('`', closer.pos) !== -1) {
+        let nxt = -1;
+        for (let j = closerPos + 1; j < delims.length; j++) {
+          if (delims[j].canClose) { nxt = j; break; }
+        }
+        closerPos = nxt;
+        continue;
+      }
       let openerPos = -1;
       for (let j = closerPos - 1; j >= bottom; j--) {
         const o = delims[j];
@@ -1454,9 +1552,14 @@ function parseInline(text, links) {
     if (c === '`') {
       let runLen = 0;
       while (s[i + runLen] === '`') runLen++;
-      // find a matching run
+      // find a matching run; inside a live link label the search may not
+      // cross the label's closing bracket
+      let bound = n;
+      for (let bi = brackets.length - 1; bi >= 0; bi--) {
+        if (!brackets[bi].dead) { bound = brackets[bi].labelEnd; break; }
+      }
       let j = i + runLen, found = -1;
-      while (j < n) {
+      while (j < bound) {
         if (s[j] === '`') {
           let l = 0;
           while (s[j + l] === '`') l++;
@@ -1547,7 +1650,8 @@ function parseInline(text, links) {
       const node = inode('text', '![');
       node.brk = true;
       addNode(node);
-      brackets.push({ node, image: true, delimLen: delims.length, inactive: false, srcPos: i + 1 });
+      const le = scanLabelEnd(s, i + 1);
+      brackets.push({ node, image: true, delimLen: delims.length, inactive: false, srcPos: i + 1, labelEnd: le, dead: le === -1 });
       i += 2;
       continue;
     }
@@ -1556,14 +1660,15 @@ function parseInline(text, links) {
       const node = inode('text', '[');
       node.brk = true;
       addNode(node);
-      brackets.push({ node, image: false, delimLen: delims.length, inactive: false, srcPos: i });
+      const le = scanLabelEnd(s, i);
+      brackets.push({ node, image: false, delimLen: delims.length, inactive: false, srcPos: i, labelEnd: le, dead: le === -1 });
       i++;
       continue;
     }
 
     if (c === ']') {
       const br = brackets[brackets.length - 1];
-      if (!br || br.inactive) {
+      if (!br || br.inactive || br.dead) {
         if (br) brackets.pop();
         addText(']');
         i++;
@@ -1652,6 +1757,7 @@ function parseInline(text, links) {
       detach(br.node, root);
       addNode(link);
       brackets.pop();
+      if (!isRef && labelPoison(s.slice(br.srcPos + 1, i))) poisonEnds.push(endPos);
       if (!br.image) {
         // a link cannot contain another link: deactivate earlier link
         // brackets (image brackets stay live), and unwrap autolinks
@@ -1698,7 +1804,7 @@ function parseInline(text, links) {
 
     // extended autolinks at word starts
     if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) {
-      const auto = matchExtendedAutolink(s, i, brackets.length > 0, delims);
+      const auto = matchExtendedAutolink(s, i, brackets.some(b => !b.inactive), delims);
       if (auto) {
         const link = inode('link');
         link.href = auto.href;
