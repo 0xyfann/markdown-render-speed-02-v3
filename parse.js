@@ -1055,6 +1055,7 @@ function lexList(lines, start, state) {
     // that belong to such a nested item do not loosen this list
     let deepestNested = -1;
     let fenceOpen = null;
+    let fenceLocked = false;
     const noteNested = (itemSpaceLine) => {
       const mm = listMarkerAt(itemSpaceLine);
       if (mm && mm.contentCol > deepestNested) deepestNested = mm.contentCol;
@@ -1100,14 +1101,32 @@ function lexList(lines, start, state) {
           i = k;
           break;
         }
+        if (fenceOpen && fenceLocked) {
+          for (let b = i; b < k; b++) itemLines.push('');
+          i = k;
+          continue;
+        }
         stop = 'endOfList';
         break;
       }
       const ind = leadingWs(l).cols;
+      if (fenceOpen && fenceLocked && ind < contentCol) {
+        const mm = listMarkerAt(l);
+        if (!mm || !sameListType(mm, first)) {
+          itemLines.push(l);
+          const wasOpen = true;
+          noteNested(l);
+          if (!fenceOpen) fenceLocked = false;
+          i++;
+          continue;
+        }
+      }
       if (ind >= contentCol) {
         const sliced = dedentItemLine(l, contentCol);
         itemLines.push(sliced);
+        const wasOpen = fenceOpen !== null;
         noteNested(sliced);
+        if (wasOpen) fenceLocked = fenceOpen !== null;
         i++;
         continue;
       }
@@ -1116,7 +1135,7 @@ function lexList(lines, start, state) {
       // Lazy paragraph continuation inside the item.
       const lastContent = itemLines[itemLines.length - 1];
       const lazyLine = ind >= 4 ? sliceAtColumn(l, 4) : l;
-      if (lastContent !== '' && !startsInterruptingBlock(l, state, true)) {
+      if (!fenceOpen && lastContent !== '' && !startsInterruptingBlock(l, state, true)) {
         const lw2 = leadingWs(lazyLine);
         if (lw2.cols <= 3 && (matchSetext(lazyLine, lw2.pos)
             || startsInterruptingBlock(lazyLine, state, true)
@@ -1346,9 +1365,18 @@ function trimAutolinkEnd(text, minLen, whole, start) {
     const last = t[t.length - 1];
     if ('?!.,:*_~'.indexOf(last) !== -1) { t = t.slice(0, -1); continue; }
     if (last === ')') {
-      let open = 0, closed = 0;
-      for (const ch of t) { if (ch === '(') open++; else if (ch === ')') closed++; }
-      if (closed > open) { t = t.slice(0, -1); continue; }
+      // drop the trailing paren only when it is free: no unmatched (
+      // before it in the text (parens pair up left to right)
+      let depth = 0, free = false;
+      for (let k = 0; k < t.length; k++) {
+        const ch = t[k];
+        if (ch === '(') depth++;
+        else if (ch === ')') {
+          if (k === t.length - 1) free = depth === 0;
+          else if (depth > 0) depth--;
+        }
+      }
+      if (free) { t = t.slice(0, -1); continue; }
     }
     if (last === ';') {
       const m = /&[A-Za-z][A-Za-z0-9]*;$/.exec(t);
@@ -1445,7 +1473,7 @@ function parseInline(text, links) {
         // matched sits between that inner closer and this one.
         const use = o.len >= 2 && closer.len >= 2 ? 2 : 1;
         const candWeight = o.origLen >= 2 ? 2 : 1;
-        if (closer.pos > 0 && /[\p{L}\p{N}]/u.test(s[closer.pos - 1])) {
+        if (closer.len === use && closer.pos > 0 && /[\p{L}\p{N}]/u.test(s[closer.pos - 1])) {
           let blocked = false;
           for (const mc of matchedClosers) {
             if (mc.ch !== closer.ch || mc.pos <= o.pos || mc.pos >= closer.pos) continue;
@@ -1461,11 +1489,12 @@ function parseInline(text, links) {
             }
             if (!cancelled) { blocked = true; break; }
           }
-          if (blocked) continue;
+          if (blocked) { openerPos = -2; break; }
         }
         openerPos = j;
         break;
       }
+      if (openerPos === -2) openerPos = -1; // rule-X rejection is fatal to the closer
       if (openerPos === -1) {
         if (!closer.canOpen) {
           delims.splice(closerPos, 1);
@@ -1556,7 +1585,7 @@ function parseInline(text, links) {
       // cross the label's closing bracket
       let bound = n;
       for (let bi = brackets.length - 1; bi >= 0; bi--) {
-        if (!brackets[bi].dead) { bound = brackets[bi].labelEnd; break; }
+        if (!brackets[bi].dead && brackets[bi].labelEnd > i) { bound = brackets[bi].labelEnd; break; }
       }
       let j = i + runLen, found = -1;
       while (j < bound) {
