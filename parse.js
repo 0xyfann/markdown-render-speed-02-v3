@@ -1269,31 +1269,64 @@ function scanLabelEnd(s, i) {
     if (c === '`' && depth === 0) {
       let run = 0;
       while (s[j + run] === '`') run++;
-      // find the closing run of the unit; the search fails at a ] that
-      // would end a link (followed by ( or [) at the unit's own depth
-      let k = j + run, udepth = 0, closed = -1;
-      while (k < n) {
-        const cc = s[k];
-        if (cc === '`') { closed = k; break; }
-        if (cc === '[') udepth++;
-        else if (cc === ']') {
-          if (udepth === 0 && (s[k + 1] === '(' || s[k + 1] === '[')) break;
-          if (udepth > 0) udepth--;
-        }
-        k++;
+      // a code-span unit (run + middle + the next backtick run, any
+      // length) is skipped wholesale; if it never closes, the run is
+      // literal text and the scan continues after it
+      let k = j + run;
+      while (k < n && s[k] !== '`') k++;
+      if (k < n) {
+        let run2 = 0;
+        while (s[k + run2] === '`') run2++;
+        j = k + run2;
+      } else {
+        j += run;
       }
-      if (closed === -1) {
-        if (run >= 2 && s[j + run] === ']') return j + run;
-        return -1;
-      }
-      let run2 = 0;
-      while (s[closed + run2] === '`') run2++;
-      j = closed + run2;
       continue;
     }
     j++;
   }
   return -1;
+}
+
+// Marked rejects a link label whose top-level backtick runs are odd in
+// number, unless the label ends with a backtick run of length >= 2.
+// Runs inside nested brackets do not count; runs inside a code-span
+// unit (and the unit's closing run) do.
+function labelParityDead(label) {
+  const n = label.length;
+  let depth = 0, runs = 0, i = 0, inUnit = false;
+  while (i < n) {
+    const c = label[i];
+    if (inUnit) {
+      if (c === '`') {
+        let r = 0;
+        while (label[i + r] === '`') r++;
+        runs++;
+        i += r;
+        inUnit = false;
+        continue;
+      }
+      i++;
+      continue;
+    }
+    if (c === '\\') { i += 2; continue; }
+    if (c === '[') { depth++; i++; continue; }
+    if (c === ']') { if (depth > 0) depth--; i++; continue; }
+    if (c === '`' && depth === 0) {
+      let r = 0;
+      while (label[i + r] === '`') r++;
+      runs++;
+      i += r;
+      inUnit = true;
+      continue;
+    }
+    i++;
+  }
+  if (runs % 2 === 0) return false;
+  // exception: the label ends with a backtick run of length >= 2
+  let tail = 0;
+  while (tail < n && label[n - 1 - tail] === '`') tail++;
+  return tail < 2;
 }
 
 // Try an extended (GFM) autolink at s[i]: http(s)://, ftp://, www., or an
@@ -1439,6 +1472,27 @@ function parseInline(text, links) {
   // emphasis match whose closer is followed by a backtick anywhere
   // later in the same inline source.
   const poisonEnds = [];
+  // Spans of the source covered by a rejected inline-link construct
+  // ([label](...) whose parens close but whose dest/title is invalid,
+  // or whose label is parity-dead): emphasis delimiters inside them
+  // never match.
+  const inertRegions = [];
+  const inInert = (pos) => inertRegions.some(r => pos >= r[0] && pos < r[1]);
+  // Find the end of the parenthesised group starting at s[p] === '(',
+  // honouring nesting and escapes; -1 if it never closes on this
+  // paragraph (a blank line also ends the search).
+  function parenExtent(p) {
+    let depth = 1, j = p + 1;
+    while (j < n) {
+      const c = s[j];
+      if (c === '\\') { j += 2; continue; }
+      if (c === '\n' && (s[j + 1] === '\n' || /^[ \t]*\n/.test(s.slice(j + 1)))) return -1;
+      if (c === '(') depth++;
+      else if (c === ')') { depth--; if (depth === 0) return j + 1; }
+      j++;
+    }
+    return -1;
+  }
 
   function addText(str) {
     if (!str) return;
@@ -1451,14 +1505,14 @@ function parseInline(text, links) {
   function processEmphasis(bottom) {
     let closerPos = -1;
     for (let j = bottom; j < delims.length; j++) {
-      if (delims[j].canClose) { closerPos = j; break; }
+      if (delims[j].canClose && !inInert(delims[j].pos)) { closerPos = j; break; }
     }
     while (closerPos !== -1) {
       const closer = delims[closerPos];
       if (poisonEnds.some(e => e <= closer.pos) && s.indexOf('`', closer.pos) !== -1) {
         let nxt = -1;
         for (let j = closerPos + 1; j < delims.length; j++) {
-          if (delims[j].canClose) { nxt = j; break; }
+          if (delims[j].canClose && !inInert(delims[j].pos)) { nxt = j; break; }
         }
         closerPos = nxt;
         continue;
@@ -1466,7 +1520,7 @@ function parseInline(text, links) {
       let openerPos = -1;
       for (let j = closerPos - 1; j >= bottom; j--) {
         const o = delims[j];
-        if (o.ch !== closer.ch || !o.canOpen) continue;
+        if (o.ch !== closer.ch || !o.canOpen || inInert(o.pos)) continue;
         if (o.canClose || closer.canOpen) {
           const sum = o.len + closer.len;
           if (sum % 3 === 0 && !(o.len % 3 === 0 && closer.len % 3 === 0)) continue;
@@ -1547,7 +1601,7 @@ function parseInline(text, links) {
       // advance to next closer
       let next = -1;
       for (let j = Math.max(closerPos, bottom); j < delims.length; j++) {
-        if (delims[j].canClose) { next = j; break; }
+        if (delims[j].canClose && !inInert(delims[j].pos)) { next = j; break; }
       }
       closerPos = next;
     }
@@ -1686,7 +1740,7 @@ function parseInline(text, links) {
       node.brk = true;
       addNode(node);
       const le = scanLabelEnd(s, i + 1);
-      brackets.push({ node, image: true, delimLen: delims.length, inactive: false, srcPos: i + 1, labelEnd: le, dead: le === -1 });
+      brackets.push({ node, image: true, delimLen: delims.length, inactive: false, srcPos: i + 1, labelEnd: le, dead: le === -1 || labelParityDead(s.slice(i + 2, le)) });
       i += 2;
       continue;
     }
@@ -1696,14 +1750,23 @@ function parseInline(text, links) {
       node.brk = true;
       addNode(node);
       const le = scanLabelEnd(s, i);
-      brackets.push({ node, image: false, delimLen: delims.length, inactive: false, srcPos: i, labelEnd: le, dead: le === -1 });
+      brackets.push({ node, image: false, delimLen: delims.length, inactive: false, srcPos: i, labelEnd: le, dead: le === -1 || labelParityDead(s.slice(i + 1, le)) });
       i++;
       continue;
     }
 
     if (c === ']') {
       const br = brackets[brackets.length - 1];
+      if (br && !br.inactive && !br.dead && br.labelEnd > i) {
+        addText(']');
+        i++;
+        continue;
+      }
       if (!br || br.inactive || br.dead) {
+        if (br && br.dead && br.labelEnd === i && s[i + 1] === '(') {
+          const ext = parenExtent(i + 1);
+          if (ext !== -1) inertRegions.push([br.srcPos, ext]);
+        }
         if (br) brackets.pop();
         addText(']');
         i++;
@@ -1771,6 +1834,10 @@ function parseInline(text, links) {
         }
       }
       if (endPos === -1) {
+        if (s[p] === '(') {
+          const ext = parenExtent(p);
+          if (ext !== -1) inertRegions.push([br.srcPos, ext]);
+        }
         brackets.pop();
         addText(']');
         i++;
