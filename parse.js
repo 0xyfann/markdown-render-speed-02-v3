@@ -728,7 +728,13 @@ function lexBlocks(lines, state, topLevel) {
             while (l[p] === f.ch) { p++; cnt++; }
             if (cnt >= f.len && isBlankFrom(l, p)) { i++; break; }
           }
-          body.push(removeCols(l, Math.min(cols, lw.cols)));
+          if (f.ch === '~') body.push(l);
+          else {
+            // backtick fence: strip up to `cols` leading whitespace CHARACTERS
+            let cut = 0;
+            while (cut < cols && cut < l.length && (l[cut] === ' ' || l[cut] === '\t')) cut++;
+            body.push(l.slice(cut));
+          }
           i++;
         }
         if (body.length && body[body.length - 1] === '') body.pop();
