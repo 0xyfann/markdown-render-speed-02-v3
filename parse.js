@@ -1548,7 +1548,7 @@ function parseInline(text, links) {
         // matched sits between that inner closer and this one.
         const use = o.len >= 2 && closer.len >= 2 ? 2 : 1;
         const candWeight = o.origLen >= 2 ? 2 : 1;
-        if (closer.len === use && closer.pos > 0 && /[\p{L}\p{N}]/u.test(s[closer.pos - 1])) {
+        if (closer.len <= 2 && closer.pos > 0 && /[\p{L}\p{N}]/u.test(s[closer.pos - 1])) {
           let blocked = false;
           for (const mc of matchedClosers) {
             if (mc.ch !== closer.ch || mc.pos <= o.pos || mc.pos >= closer.pos) continue;
@@ -1556,15 +1556,20 @@ function parseInline(text, links) {
             if (!(mc.end < s.length && /[\p{L}\p{N}]/u.test(s[mc.end]))) continue;
             if (mc.openerPos > 0 && /[\p{L}\p{N}]/u.test(s[mc.openerPos - 1])) continue;
             let cancelled = false;
-            for (const r of allRuns) {
-              if (r.ch === closer.ch && !r.used && r.pos > mc.pos && r.pos < closer.pos) {
-                cancelled = true;
-                break;
+            if (candWeight === 2) {
+              for (const r of allRuns) {
+                if (r.ch === closer.ch && !r.used && r.pos > mc.pos && r.pos < closer.pos) {
+                  cancelled = true;
+                  break;
+                }
               }
             }
             if (!cancelled) { blocked = true; break; }
           }
-          if (blocked) { openerPos = -2; break; }
+          if (blocked) {
+            if (closer.len === use) { openerPos = -2; break; }
+            continue;
+          }
         }
         openerPos = j;
         break;
@@ -1593,6 +1598,21 @@ function parseInline(text, links) {
         opener.node.next = wrap;
         closer.node.prev = wrap;
         if (root.last === closer.node) root.last = closer.node; // unchanged
+        // split-closer: when this match leaves part of the closer run
+        // unused, marked renders the leftover inside the span if the
+        // span contains a mixed-weight inner match and the closer run
+        // directly follows an alphanumeric
+        let splitInside = false;
+        if (closer.len > use) {
+          // the relevant inner match: the rightmost recorded inner
+          // closer inside this span (latest record wins a tie)
+          let rel = null;
+          for (const mc of matchedClosers) {
+            if (mc.ch !== closer.ch || mc.pos <= opener.pos || mc.pos >= closer.pos) continue;
+            if (!rel || mc.pos >= rel.pos) rel = mc;
+          }
+          if (rel && rel.use !== use && rel.end < s.length && !isSpace(s[rel.end])) splitInside = true;
+        }
         matchedClosers.push({ ch: closer.ch, pos: closer.pos, end: closer.pos + closer.origLen, use, openerPos: opener.pos });
         opener.used = true;
         closer.used = true;
@@ -1600,6 +1620,10 @@ function parseInline(text, links) {
         closer.len -= use;
         opener.node.s = opener.node.s.slice(0, opener.len);
         closer.node.s = closer.node.s.slice(closer.node.s.length - closer.len);
+        if (splitInside && closer.len > 0) {
+          appendNode(wrap, inode('text', closer.node.s));
+          closer.node.s = '';
+        }
         // drop delimiters that were between the pair
         delims.splice(openerPos + 1, closerPos - openerPos - 1);
         closerPos = openerPos + 1;
