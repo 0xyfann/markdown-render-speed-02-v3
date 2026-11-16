@@ -1270,17 +1270,32 @@ function scanLabelEnd(s, i) {
       let run = 0;
       while (s[j + run] === '`') run++;
       // a code-span unit (run + middle + the next backtick run, any
-      // length) is skipped wholesale; if it never closes, the run is
-      // literal text and the scan continues after it
+      // length) is skipped wholesale — unless that next run is itself
+      // the opener of a code span (a later run of the same length
+      // follows it with no ']' in between), in which case the unit
+      // fails and the opening run is literal text
       let k = j + run;
       while (k < n && s[k] !== '`') k++;
+      let closed = false;
       if (k < n) {
         let run2 = 0;
         while (s[k + run2] === '`') run2++;
-        j = k + run2;
-      } else {
-        j += run;
+        let busy = false, m = k + run2;
+        while (m < n) {
+          if (s[m] === '\\') { m += 2; continue; }
+          if (s[m] === ']') break;
+          if (s[m] === '`') {
+            let r3 = 0;
+            while (s[m + r3] === '`') r3++;
+            if (r3 === run2) { busy = true; break; }
+            m += r3;
+            continue;
+          }
+          m++;
+        }
+        if (!busy) { j = k + run2; closed = true; }
       }
+      if (!closed) j += run;
       continue;
     }
     j++;
