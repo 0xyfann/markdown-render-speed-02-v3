@@ -66,8 +66,35 @@ function isAlnumU(ch) {
   return ch !== undefined && ch.length === 1 && ALNUM_U_RE.test(ch);
 }
 
+const SPACE_EXTRA = new Set([0xa0, 0x1680, 0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007, 0x2008, 0x2009, 0x200a, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000, 0xfeff]);
 function isSpace(ch) {
-  return ch !== undefined && /\s/.test(ch);
+  if (ch === undefined) return false;
+  const code = ch.charCodeAt(0);
+  if (code < 128) return code === 32 || (code >= 9 && code <= 13);
+  return SPACE_EXTRA.has(code);
+}
+// ASCII character-class tables for the autolink scanners: address
+// characters (local part / boundary class) and alphanumerics.
+const ADDR_TABLE = new Uint8Array(128);
+for (const ch of "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.!#$%&'*+\/=?^_`{|}~@-") ADDR_TABLE[ch.charCodeAt(0)] = 1;
+function isAddrChar(ch) {
+  if (ch === undefined) return false;
+  const code = ch.charCodeAt(0);
+  return code < 128 && ADDR_TABLE[code] === 1;
+}
+function isAlnumCh(ch) {
+  if (ch === undefined) return false;
+  const code = ch.charCodeAt(0);
+  return (code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+}
+// case-insensitive startsWith for a lowercase ASCII word
+function startsWithCI(s, i, word) {
+  for (let k = 0; k < word.length; k++) {
+    let code = s.charCodeAt(i + k);
+    if (code >= 65 && code <= 90) code += 32;
+    if (code !== word.charCodeAt(k)) return false;
+  }
+  return true;
 }
 
 // Decode a numeric character reference body (the part between &# and ;).
@@ -92,6 +119,7 @@ function decodeNumericRef(body) {
 // only when it is not a valid escape introducer in its table — marked's
 // behaviour is encodeURI with %25 restored when it came from an original %).
 const HREF_SAFE = new Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789;/?:@&=+$,-_.!~*'()#%");
+const HREF_ENCODER = new TextEncoder();
 function encodeHref(href) {
   let out = '';
   for (const ch of href) {
@@ -101,7 +129,7 @@ function encodeHref(href) {
     if (cp < 0x80) {
       out += '%' + cp.toString(16).toUpperCase().padStart(2, '0');
     } else {
-      for (const byte of new TextEncoder().encode(String.fromCodePoint(cp))) {
+      for (const byte of HREF_ENCODER.encode(String.fromCodePoint(cp))) {
         out += '%' + byte.toString(16).toUpperCase().padStart(2, '0');
       }
     }
@@ -1247,8 +1275,9 @@ function finishEmail(text, s, end, delims) {
     t = nt;
   }
 }
-const SCHEME_AUTOLINK_RE = /^<([A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\s]*)>/;
-const EMAIL_AUTOLINK_RE = /^<([A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+)>/;
+const NUMREF_RE = /&#(?:[0-9]+|[xX][0-9A-Fa-f]+);/y;
+const SCHEME_AUTOLINK_RE = /<([A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\s]*)>/y;
+const EMAIL_AUTOLINK_RE = /<([A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+)>/y;
 
 // Validate a link label starting after the bracket at s[i] ('['), using
 // marked's label grammar: balanced nested brackets, backslash escapes,
@@ -1350,13 +1379,28 @@ function matchExtendedAutolink(s, i, inBrackets, delims) {
   if (IN_LINK) return null;
   // word boundary: the previous character must not be part of an address
   const prev = i > 0 ? s[i - 1] : '';
-  if (/[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~@-]/.test(prev)) return null;
-  const head = s.slice(i, i + 8).toLowerCase();
+  if (isAddrChar(prev)) return null;
   let prefix = null, hrefPrefix = '';
-  if (head.startsWith('https://')) prefix = s.slice(i, i + 8);
-  else if (head.startsWith('http://')) prefix = s.slice(i, i + 7);
-  else if (head.startsWith('ftp://')) prefix = s.slice(i, i + 6);
-  else if (s.startsWith('www.', i)) { prefix = 'www.'; hrefPrefix = 'http://'; }
+  const c0 = s.charCodeAt(i) | 32; // ASCII case fold
+  if (c0 === 104) { // h
+    if (startsWithCI(s, i, 'https://')) prefix = s.slice(i, i + 8);
+    else if (startsWithCI(s, i, 'http://')) prefix = s.slice(i, i + 7);
+  } else if (c0 === 102) { // f
+    if (startsWithCI(s, i, 'ftp://')) prefix = s.slice(i, i + 6);
+  } else if (c0 === 119) { // w
+    if (s.startsWith('www.', i)) { prefix = 'www.'; hrefPrefix = 'http://'; }
+  }
+  if (prefix) {
+    // marked requires the first char after the scheme/www. prefix to be
+    // [A-Za-z0-9-]; a failed scheme match is not retried as an email,
+    // but a failed www. match is (www. can be an email local part).
+    const fc = s.charCodeAt(i + prefix.length);
+    const fcOk = (fc >= 48 && fc <= 57) || (fc >= 65 && fc <= 90) || (fc >= 97 && fc <= 122) || fc === 45;
+    if (!fcOk) {
+      if (prefix === 'www.') { prefix = null; hrefPrefix = ''; }
+      else return null;
+    }
+  }
   if (prefix) {
     let j = i + prefix.length;
     while (j < s.length && !isSpace(s[j]) && s[j] !== '<'
@@ -1367,7 +1411,7 @@ function matchExtendedAutolink(s, i, inBrackets, delims) {
     if (text.length <= prefix.length) return null;
     return { text, href: hrefPrefix + text, end: i + text.length };
   }
-  if (head.startsWith('mailto:')) {
+  if (c0 === 109 && startsWithCI(s, i, 'mailto:')) {
     const m = EMAIL_RE.exec(s.slice(i + 7, i + 7 + 320));
     if (m) {
       const em = finishEmail(m[0], s, i + 7 + m[0].length, delims);
@@ -1378,7 +1422,7 @@ function matchExtendedAutolink(s, i, inBrackets, delims) {
     }
     return null;
   }
-  if (head.startsWith('xmpp:')) {
+  if (c0 === 120 && startsWithCI(s, i, 'xmpp:')) {
     const m = EMAIL_RE.exec(s.slice(i + 5, i + 5 + 320));
     if (m) {
       const em = finishEmail(m[0], s, i + 5 + m[0].length, delims);
@@ -1394,6 +1438,17 @@ function matchExtendedAutolink(s, i, inBrackets, delims) {
       }
     }
     return null;
+  }
+  // cheap pre-scan: an email can only start here if a run of local-part
+  // characters is immediately followed by '@'
+  {
+    let j = i;
+    while (j < s.length) {
+      const code = s.charCodeAt(j);
+      if (code >= 128 || ADDR_TABLE[code] !== 1 || code === 64) break;
+      j++;
+    }
+    if (j === i || s[j] !== '@') return null;
   }
   const m = EMAIL_RE.exec(s.slice(i, i + 320));
   if (!m) return null;
@@ -1711,8 +1766,8 @@ function parseInline(text, links) {
     }
 
     if (c === '<') {
-      const rest = s.slice(i);
-      let m = SCHEME_AUTOLINK_RE.exec(rest);
+      SCHEME_AUTOLINK_RE.lastIndex = i;
+      let m = SCHEME_AUTOLINK_RE.exec(s);
       if (m) {
         const link = inode('link');
         link.href = m[1];
@@ -1722,7 +1777,8 @@ function parseInline(text, links) {
         i += m[0].length;
         continue;
       }
-      m = EMAIL_AUTOLINK_RE.exec(rest);
+      EMAIL_AUTOLINK_RE.lastIndex = i;
+      m = EMAIL_AUTOLINK_RE.exec(s);
       if (m) {
         const link = inode('link');
         link.href = 'mailto:' + m[1];
@@ -1734,18 +1790,18 @@ function parseInline(text, links) {
       }
       // raw HTML forms
       let htmlEnd = -1, isHtml = false;
-      if (rest.startsWith('<!--')) {
-        const end = rest.indexOf('-->', 2);
-        if (end !== -1) { htmlEnd = end + 3; isHtml = true; }
-      } else if (rest.startsWith('<?')) {
-        const end = rest.indexOf('?>', 2);
-        if (end !== -1) { htmlEnd = end + 2; isHtml = true; }
-      } else if (rest.startsWith('<![CDATA[')) {
-        const end = rest.indexOf(']]>', 9);
-        if (end !== -1) { htmlEnd = end + 3; isHtml = true; }
-      } else if (/^<![A-Za-z]/.test(rest)) {
-        const end = rest.indexOf('>', 2);
-        if (end !== -1) { htmlEnd = end + 1; isHtml = true; }
+      if (s.startsWith('<!--', i)) {
+        const end = s.indexOf('-->', i + 2);
+        if (end !== -1) { htmlEnd = end + 3 - i; isHtml = true; }
+      } else if (s.startsWith('<?', i)) {
+        const end = s.indexOf('?>', i + 2);
+        if (end !== -1) { htmlEnd = end + 2 - i; isHtml = true; }
+      } else if (s.startsWith('<![CDATA[', i)) {
+        const end = s.indexOf(']]>', i + 9);
+        if (end !== -1) { htmlEnd = end + 3 - i; isHtml = true; }
+      } else if (/^<![A-Za-z]/.test(s.slice(i, i + 3))) {
+        const end = s.indexOf('>', i + 2);
+        if (end !== -1) { htmlEnd = end + 1 - i; isHtml = true; }
       } else {
         const t = matchTagAt(s, i, false);
         if (t > 0) { htmlEnd = t - i; isHtml = true; }
@@ -1764,7 +1820,8 @@ function parseInline(text, links) {
     }
 
     if (c === '&') {
-      const m = /^&#(?:[0-9]+|[xX][0-9A-Fa-f]+);/.exec(s.slice(i, i + 12));
+      NUMREF_RE.lastIndex = i;
+      const m = NUMREF_RE.exec(s);
       if (m) {
         const decoded = decodeNumericRef(m[0].slice(2, -1));
         if (decoded !== null) { addNode(inode('esc', decoded)); i += m[0].length; continue; }
@@ -1966,8 +2023,11 @@ function parseInline(text, links) {
       if (cc === '\\' || cc === '`' || cc === '<' || cc === '&' || cc === '[' || cc === ']'
           || cc === '*' || cc === '_' || cc === '~' || cc === '\n') break;
       if (cc === '!' && s[j + 1] === '[') break;
-      if (/[A-Za-z0-9]/.test(cc)
-          && !/[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~@-]/.test(s[j - 1])) break;
+      const code = s.charCodeAt(j);
+      if (code < 128 && ((code >= 48 && code <= 57) || (code >= 65 && code <= 90) || (code >= 97 && code <= 122))) {
+        const pcode = s.charCodeAt(j - 1);
+        if (pcode >= 128 || ADDR_TABLE[pcode] !== 1) break;
+      }
       j++;
     }
     addText(s.slice(i, j));
@@ -2111,7 +2171,7 @@ function renderItem(blocks, tight, links) {
   let bs = blocks;
   if (bs.length && bs[0].t === 'para') {
     const txt = bs[0].text;
-    const task = /^\[( |x|X)\]( )/.exec(txt) || /^\[( |x|X)\]$/.exec(txt);
+    const task = txt.charCodeAt(0) === 91 ? (/^\[( |x|X)\]( )/.exec(txt) || /^\[( |x|X)\]$/.exec(txt)) : null;
     if (task) {
       const checked = task[1] !== ' ';
       prefix = checked
